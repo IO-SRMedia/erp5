@@ -21,6 +21,7 @@ import traceback
 import urllib
 import ConfigParser
 from contextlib import contextmanager
+
 from cStringIO import StringIO
 from cPickle import dumps
 from glob import glob
@@ -60,7 +61,7 @@ from Testing.ZopeTestCase import PortalTestCase, user_name
 from Products.DCWorkflow.DCWorkflow import ValidationFailed
 from Products.PythonScripts.PythonScript import PythonScript
 from Products.ERP5Type.Accessor.Constant import PropertyGetter as ConstantGetter
-from zLOG import LOG, DEBUG
+from zLOG import LOG, DEBUG, WARNING
 
 from Products.ERP5Type.tests.backportUnittest import SetupSiteError
 from Products.ERP5Type.tests.utils import addUserToDeveloperRole
@@ -844,7 +845,6 @@ class ERP5TypeCommandLineTestCase(ERP5TypeTestCaseMixin):
       # Let's be a litte tolerant for the moment.
       BaseMessage.max_retry = property(lambda self:
         self.activity_kw.get('max_retry', 1))
-
       template_list = list(self.getBusinessTemplateList())
       erp5_catalog_storage = os.environ.get('erp5_catalog_storage',
                                             'erp5_mysql_innodb_catalog')
@@ -860,6 +860,14 @@ class ERP5TypeCommandLineTestCase(ERP5TypeTestCaseMixin):
       light_install = self.enableLightInstall()
       create_activities = self.enableActivityTool()
       hot_reindexing = self.enableHotReindexing()
+      for x, y in (("erp5_core_proxy_field_legacy", "erp5_base"),
+        ("erp5_stock_cache", "erp5_pdm")):
+        if x not in template_list:
+          try:
+            template_list.insert(template_list.index(y), x)
+          except ValueError:
+            pass
+
       self.setUpERP5Site(business_template_list=template_list,
                          light_install=light_install,
                          create_activities=create_activities,
@@ -1041,6 +1049,33 @@ class ERP5TypeCommandLineTestCase(ERP5TypeTestCaseMixin):
         if not quiet:
           ZopeTestCase._print('done (%.3fs)\n' % (time.time() - start))
 
+    def dynamicWorkflowConversion(self):
+      # Converting DCWorkflow dynamically
+      workflow_tool = self.getWorkflowTool()
+      type_workflow_dict = workflow_tool.getChainsByType()
+      type_tool = self.getTypesTool()
+      if workflow_tool:
+        for workflow_id in workflow_tool.objectIds():
+          # Do not convert workflow's live test related workflows.
+          if workflow_id in ['testing_initial_dc_interaction_workflow', 'testing_initial_dc_workflow']:
+            continue
+          workflow = workflow_tool._getOb(workflow_id)
+          if workflow.getPortalType() not in ['Workflow', 'Interaction Workflow', 'Configuration Workflow']:
+            new_workflow = workflow_tool.dc_workflow_asERP5Object(workflow, is_temporary=False)
+            workflow_tool.reassignWorkflow(workflow_id)
+            self.commit()
+        # force convert edit_workflow: Why have to load edit_workflow this way?
+        edit_workflow = workflow_tool._getOb('edit_workflow', None)
+        if edit_workflow is not None:
+          new_workflow = workflow_tool.dc_workflow_asERP5Object(edit_workflow, is_temporary=False)
+          workflow_tool.reassignWorkflow('edit_workflow')
+          self.commit()
+        # Reset the original workflows assignement order.
+        for type_value in sorted(type_tool.objectValues()):
+          type_value.workflow_list = tuple(reversed(type_value.workflow_list))
+          LOG(" || Portal Type: '%s': '%s'"%(type_value.getId(), type_value.workflow_list), 0, "")
+        self.commit()
+
     def setUpERP5Site(self,
                      business_template_list=(),
                      quiet=0,
@@ -1139,17 +1174,17 @@ class ERP5TypeCommandLineTestCase(ERP5TypeTestCaseMixin):
             user = uf.getUserById('ERP5TypeTestCase').__of__(uf)
 
             self._callSetUpOnce()
-            self._reindexSite()
 
             # Enable reindexing
             # Do hot reindexing # Does not work
             if hot_reindexing:
               setattr(app,'isIndexable', 1)
               portal.portal_catalog.manage_hotReindexAll()
-
+            self.dynamicWorkflowConversion()
             portal.portal_types.resetDynamicDocumentsOnceAtTransactionBoundary()
+            self.getPortal().erp5_sql_connection.manage_test("update message_queue set processing_node=0, priority=1 where processing_node=-1")
+            self.getPortal().erp5_sql_connection.manage_test("update message set processing_node=0, priority=2 where processing_node=-1")
             self.tic(not quiet)
-
             # Log out
             if not quiet:
               ZopeTestCase._print('Logout ... \n')
